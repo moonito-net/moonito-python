@@ -19,13 +19,28 @@ class Config:
         api_public_key: str,
         api_secret_key: str,
         unwanted_visitor_to: Optional[str] = None,
-        unwanted_visitor_action: Optional[int] = None
+        unwanted_visitor_action: Optional[int] = None,
+        challenge_action: str = 'allow',
+        endpoint: Optional[str] = None
     ):
         self.is_protected = is_protected
         self.api_public_key = api_public_key
         self.api_secret_key = api_secret_key
         self.unwanted_visitor_to = unwanted_visitor_to
         self.unwanted_visitor_action = unwanted_visitor_action
+        self.endpoint = endpoint
+
+        # What to do when the engine asks for a challenge.
+        #
+        #   allow      treat it as an allow and log it. The default.
+        #   block      treat it as a block.
+        #   challenge  actually show the interstitial.
+        #
+        # The default is 'allow' on purpose, matching the PHP SDK. Turning a
+        # scored challenge into a real page interruption changes what a visitor
+        # sees, and that is the site owner's decision, not a side effect of
+        # taking an upgrade.
+        self.challenge_action = challenge_action
 
 
 class VisitorTrafficFiltering:
@@ -139,6 +154,9 @@ class VisitorTrafficFiltering:
                 client_ip, user_agent, url, domain,
                 client_token=self._read_client_token(request),
                 request_headers=self._collect_headers(request),
+                challenge_pass=self._read_challenge_pass(request),
+                method=getattr(request, 'method', None),
+                path=url,
             )
             
             if response_data.get('error'):
@@ -162,7 +180,32 @@ class VisitorTrafficFiltering:
                     'detect_activity': detect_activity,
                     'content': self._get_blocked_content()
                 }
-            
+
+            # A challenge is outranked by a block, so it is only considered
+            # once the visitor was not blocked outright.
+            challenge_url = response_data.get('data', {}).get('challenge_url')
+
+            if isinstance(challenge_url, str) and challenge_url:
+                action = getattr(self.config, 'challenge_action', 'allow')
+
+                if action == 'challenge':
+                    return {
+                        'need_to_block': False,
+                        'challenge': True,
+                        'detect_activity': detect_activity,
+                        'content': self.challenge_html(request, challenge_url),
+                    }
+
+                if action == 'block':
+                    return {
+                        'need_to_block': True,
+                        'detect_activity': detect_activity,
+                        'content': self._get_blocked_content(),
+                    }
+
+                # 'allow' falls through: the verdict is logged server side and
+                # the visitor is not interrupted.
+
             return None
             
         except Exception as error:
@@ -243,21 +286,112 @@ class VisitorTrafficFiltering:
     
     VERSION = '2.0.0'
     IDENTITY_COOKIE = '__mo_ct'
+    PASS_COOKIE = '__mo_pass'
+
+    def challenge_html(self, request, challenge_url: str) -> str:
+        """The page that carries the visitor to the challenge and back.
+
+        A plain redirect would be simpler and would lose every POST. Somebody
+        halfway through a checkout would return to an empty form and blame the
+        site, so the body is stashed in sessionStorage on the customer's own
+        origin and replayed when the challenge sends them back.
+
+        The stash cannot hold a file input, because script cannot put a file
+        back into a form. That is said plainly rather than silently dropped.
+        """
+        method = str(getattr(request, 'method', 'GET') or 'GET').upper()
+        fields = self._flatten_body(request) if method == 'POST' else {}
+
+        content_type = ''
+
+        try:
+            content_type = request.headers.get('Content-Type', '') or ''
+        except Exception:
+            content_type = ''
+
+        has_upload = method == 'POST' and content_type.startswith('multipart/form-data')
+
+        stash = json.dumps({
+            'u': str(getattr(request, 'full_path', None) or getattr(request, 'path', '/') or '/'),
+            'm': method,
+            'f': fields,
+        })
+
+        note = ('<p>You will need to choose your file again after this check.</p>'
+                if has_upload else '')
+
+        # Encoded twice: once for the value, once so the result is a JavaScript
+        # string literal, then < is escaped so it cannot close the script tag.
+        payload = json.dumps(stash).replace('<', '\\u003c')
+        target = json.dumps(challenge_url).replace('<', '\\u003c')
+
+        return (
+            '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<meta name="robots" content="noindex, nofollow">'
+            '<title>Checking your browser</title></head>'
+            '<body><p>Checking your browser before you continue.</p>' + note +
+            '<script>(function(){try{sessionStorage.setItem("__mo_resume",' +
+            payload + ');}catch(e){}location.replace(' + target + ');})();</script>'
+            '<noscript><p>JavaScript is required to continue.</p></noscript>'
+            '</body></html>'
+        )
+
+    def _flatten_body(self, request) -> Dict[str, str]:
+        """Form fields as name/value pairs, capped.
+
+        A body big enough to fill sessionStorage would break the resume rather
+        than help it, so anything past the cap is dropped and the visitor
+        retypes it. That beats a page that silently fails to load.
+        """
+        out: Dict[str, str] = {}
+
+        try:
+            form = getattr(request, 'form', None)
+
+            if form is None:
+                return out
+
+            items = form.lists() if hasattr(form, 'lists') else form.items()
+
+            for name, value in items:
+                if len(out) >= 200:
+                    break
+
+                if isinstance(value, (list, tuple)):
+                    value = value[0] if value else ''
+
+                text = str(value)
+
+                if len(text) <= 8192:
+                    out[str(name)] = text
+        except Exception:
+            # A framework whose request object works differently. The visitor
+            # still gets the challenge, they just retype the form.
+            return {}
+
+        return out
 
     def _request_analytics_api(
         self, ip: str, user_agent: str, event: str, domain: str,
         client_token: Optional[str] = None,
         request_headers: Optional[Dict[str, str]] = None,
+        challenge_pass: Optional[str] = None,
+        method: Optional[str] = None,
+        path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Make a request to the analytics API.
+        """Ask the decision API what to do with this visitor.
 
-        client_token and request_headers are optional and additive. They are
-        what the rotation detectors need: without them the API can only judge a
-        request on its own address and user agent, which is exactly what a
-        rotating residential pool is built to defeat. A caller that sends
-        neither gets the same answer it has always got.
+        v2 rather than v1, because v1 has no way to say "challenge". The two
+        endpoints are metered the same and return the same body; v2 adds
+        challenge_url, decision_id and nonce. On v1 a challenge verdict
+        collapses to allow before it reaches the caller, since the server will
+        not hand back an instruction the client cannot carry out. A v1 SDK
+        therefore lets a suspected rotating proxy through while the log records
+        it as challenged, which reads like the visitor was stopped when they
+        were not.
         """
-        params = {
+        body: Dict[str, Any] = {
             'ip': ip,
             'ua': user_agent,
             'events': event,
@@ -266,31 +400,74 @@ class VisitorTrafficFiltering:
         }
 
         if client_token:
-            params['client_token'] = client_token
+            body['client_token'] = client_token
 
-        for name, value in (request_headers or {}).items():
-            if isinstance(value, str) and len(value) <= 2048:
-                params[f'headers[{name}]'] = value
+        # Proof this visitor already solved a challenge. Without it they are
+        # asked again on the very next request, which is a loop.
+        if challenge_pass:
+            body['challenge_pass'] = challenge_pass
 
-        query_params = urllib.parse.urlencode(params)
-        
-        url = f'https://moonito.net/api/v1/analytics?{query_params}'
-        
+        if method:
+            body['method'] = method
+
+        if path:
+            body['path'] = path
+
+        headers_out = {
+            name: value
+            for name, value in (request_headers or {}).items()
+            if isinstance(value, str) and len(value) <= 2048
+        }
+
+        if headers_out:
+            body['headers'] = headers_out
+
+        payload = json.dumps(body).encode('utf-8')
+        url = f'{self._endpoint()}/api/v2/decision'
+
         headers = {
             'User-Agent': user_agent,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
             'X-Public-Key': self.config.api_public_key,
             'X-Secret-Key': self.config.api_secret_key,
         }
-        
-        req = urllib.request.Request(url, headers=headers)
-        
+
+        req = urllib.request.Request(url, data=payload, headers=headers, method='POST')
+
         try:
             with urllib.request.urlopen(req) as response:
                 data = response.read().decode('utf-8')
                 return json.loads(data)
         except urllib.error.URLError as e:
             raise Exception(f"API request failed: {str(e)}")
-    
+
+    def _endpoint(self) -> str:
+        configured = getattr(self.config, 'endpoint', None)
+
+        if isinstance(configured, str) and configured:
+            return configured.rstrip('/')
+
+        return 'https://moonito.net'
+
+    def _read_challenge_pass(self, request) -> Optional[str]:
+        """The proof that this visitor already passed a challenge.
+
+        Forwarded without validation. The pass is signed with the domain
+        secret, so checking it here would mean reimplementing the MAC in every
+        language. The server checks it and a forged one simply fails there.
+        """
+        try:
+            cookies = getattr(request, 'cookies', None) or {}
+            value = cookies.get(self.PASS_COOKIE)
+        except Exception:
+            return None
+
+        if not isinstance(value, str) or not value or len(value) > 1024:
+            return None
+
+        return value
+
     def _read_client_token(self, request) -> Optional[str]:
         """The visitor's identity token, if they are carrying one.
 
