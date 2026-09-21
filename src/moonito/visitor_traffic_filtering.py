@@ -44,6 +44,34 @@ class VisitorTrafficFiltering:
         self.config = config
         self.bypass_token = self._generate_secure_token()
     
+    def apply_token(self, response):
+        """Set the identity cookie on a framework response, if one is due.
+
+        Call this once per request, after evaluate_visitor. It is a no-op when
+        there is nothing to set, so it is safe to call unconditionally.
+        """
+        descriptor = getattr(self, 'pending_token', None)
+
+        if not descriptor:
+            return response
+
+        self.pending_token = None
+
+        try:
+            response.set_cookie(
+                descriptor['name'],
+                descriptor['value'],
+                max_age=descriptor['max_age'],
+                path='/',
+                samesite='Lax',
+            )
+        except Exception:
+            # A framework whose response object works differently. The visitor
+            # simply stays anonymous, which is a supported mode.
+            pass
+
+        return response
+
     def _generate_secure_token(self) -> str:
         """Generate a secure random token for bypass validation"""
         return secrets.token_hex(32)
@@ -108,7 +136,9 @@ class VisitorTrafficFiltering:
         
         try:
             response_data = self._request_analytics_api(
-                client_ip, user_agent, url, domain
+                client_ip, user_agent, url, domain,
+                client_token=self._read_client_token(request),
+                request_headers=self._collect_headers(request),
             )
             
             if response_data.get('error'):
@@ -117,6 +147,12 @@ class VisitorTrafficFiltering:
                     error_msg = ', '.join(error_msg)
                 raise Exception(f"Requesting analytics error: {error_msg}")
             
+            # Kept on the instance so a caller can apply it to whatever
+            # response their framework ends up sending. Without this the
+            # visitor is anonymous on every request and the detectors that
+            # reason across requests never get anything to work with.
+            self.pending_token = self.client_token_cookie(response_data)
+
             need_to_block = response_data.get('data', {}).get('status', {}).get('need_to_block', False)
             detect_activity = response_data.get('data', {}).get('status', {}).get('detect_activity')
             
@@ -205,16 +241,38 @@ class VisitorTrafficFiltering:
             print(f"Error handling visitor manually: {error}")
             raise Exception(f"Error handling visitor manually: {str(error)}")
     
+    VERSION = '2.0.0'
+    IDENTITY_COOKIE = '__mo_ct'
+
     def _request_analytics_api(
-        self, ip: str, user_agent: str, event: str, domain: str
+        self, ip: str, user_agent: str, event: str, domain: str,
+        client_token: Optional[str] = None,
+        request_headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """Make a request to the analytics API"""
-        query_params = urllib.parse.urlencode({
+        """Make a request to the analytics API.
+
+        client_token and request_headers are optional and additive. They are
+        what the rotation detectors need: without them the API can only judge a
+        request on its own address and user agent, which is exactly what a
+        rotating residential pool is built to defeat. A caller that sends
+        neither gets the same answer it has always got.
+        """
+        params = {
             'ip': ip,
             'ua': user_agent,
             'events': event,
-            'domain': domain
-        })
+            'domain': domain,
+            'sdk': f'python/{self.VERSION}',
+        }
+
+        if client_token:
+            params['client_token'] = client_token
+
+        for name, value in (request_headers or {}).items():
+            if isinstance(value, str) and len(value) <= 2048:
+                params[f'headers[{name}]'] = value
+
+        query_params = urllib.parse.urlencode(params)
         
         url = f'https://moonito.net/api/v1/analytics?{query_params}'
         
@@ -233,6 +291,65 @@ class VisitorTrafficFiltering:
         except urllib.error.URLError as e:
             raise Exception(f"API request failed: {str(e)}")
     
+    def _read_client_token(self, request) -> Optional[str]:
+        """The visitor's identity token, if they are carrying one.
+
+        Read without any attempt to validate it. The SDK cannot: the signing
+        key is server side and shipping it to every install would make it
+        public. Possessing a token confers no trust, it only tells the API
+        whose history to consult, so passing a forged one along is harmless.
+        """
+        try:
+            cookies = getattr(request, 'cookies', None) or {}
+            value = cookies.get(self.IDENTITY_COOKIE)
+        except Exception:
+            return None
+
+        if not isinstance(value, str) or not value or len(value) > 96:
+            return None
+
+        return value
+
+    def _collect_headers(self, request) -> Dict[str, str]:
+        """The request headers, for server side fingerprinting."""
+        try:
+            items = dict(getattr(request, 'headers', {}) or {})
+        except Exception:
+            return {}
+
+        out = {}
+
+        for name, value in items.items():
+            # Never forward the visitor's own credentials.
+            if str(name).lower() in ('cookie', 'authorization', 'proxy-authorization'):
+                continue
+
+            if isinstance(value, str):
+                out[str(name)] = value
+
+        return out
+
+    def client_token_cookie(self, response_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The cookie the caller should set, or None.
+
+        Returned rather than set, because this SDK does not know whether it is
+        inside Flask, Django or something else. The framework adapters call
+        this and set it their own way.
+        """
+        descriptor = (response_data or {}).get('data', {}).get('set_client_token')
+
+        if not isinstance(descriptor, dict) or not descriptor.get('value'):
+            return None
+
+        return {
+            'name': descriptor.get('name', self.IDENTITY_COOKIE),
+            'value': descriptor['value'],
+            'max_age': int(descriptor.get('max_age') or 7776000),
+            'path': '/',
+            'samesite': 'Lax',
+            'httponly': False,
+        }
+
     def _get_blocked_content(self) -> Union[int, str]:
         """Return content for blocked visitors based on configuration"""
         if self.config.unwanted_visitor_to:
