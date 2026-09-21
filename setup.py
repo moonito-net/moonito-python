@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="moonito",
-    version="1.0.0",
+    version="2.0.0",
     author="Moonito",
     author_email="support@moonito.net",
     description="Real-time analytics and AI bot protection SDK for Python web applications",
