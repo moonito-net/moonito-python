@@ -10,6 +10,16 @@ import hmac
 from typing import Optional, Dict, Any, Union
 from urllib.parse import urlparse, parse_qs
 
+# urlopen without a timeout inherits the global default socket timeout, which
+# is None, so a call could wait indefinitely and the visitor's page waited with
+# it. The install snippet already promised callers "bounded timeouts"; this is
+# what makes that true.
+#
+# Generous rather than tight: a check that gives up early is recorded as "could
+# not run" and the visitor is let through unchecked, which is the failure this
+# library exists to prevent.
+REQUEST_TIMEOUT_SECONDS = 15
+
 
 class Config:
     """Configuration for Visitor Traffic Filtering"""
@@ -436,10 +446,12 @@ class VisitorTrafficFiltering:
         req = urllib.request.Request(url, data=payload, headers=headers, method='POST')
 
         try:
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 data = response.read().decode('utf-8')
                 return json.loads(data)
-        except urllib.error.URLError as e:
+        except (urllib.error.URLError, TimeoutError) as e:
+            # A connect timeout arrives wrapped in URLError, a read timeout as
+            # a bare TimeoutError. Both mean the same thing to the caller.
             raise Exception(f"API request failed: {str(e)}")
 
     def _endpoint(self) -> str:
@@ -572,9 +584,9 @@ class VisitorTrafficFiltering:
         req = urllib.request.Request(url, headers=headers)
         
         try:
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 return response.read().decode('utf-8')
-        except urllib.error.URLError as e:
+        except (urllib.error.URLError, TimeoutError) as e:
             raise Exception(f"Request failed: {str(e)}")
     
     def _is_valid_ip(self, ip: str) -> bool:
