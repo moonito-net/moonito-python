@@ -13,6 +13,8 @@ It allows you to:
 
 Compatible with Flask, Django, FastAPI, and other Python web frameworks.
 
+`evaluate_visitor` never raises. If the check cannot run (the API is unreachable, or refuses because a plan expired) it returns `None`, the visitor is let through, and the reason goes to the `moonito` logger. Moonito never turns into an error page on your site.
+
 ## 📦 Installation
 
 ```bash
@@ -43,7 +45,7 @@ def check_visitor():
     """Middleware to check visitors before processing requests"""
     result = client.evaluate_visitor(request)
     
-    if result and result['need_to_block']:
+    if result:
         content = result['content']
         
         if isinstance(content, int):
@@ -83,7 +85,7 @@ class MoonitoMiddleware:
         # Check visitor
         result = self.client.evaluate_visitor(request)
         
-        if result and result['need_to_block']:
+        if result:
             content = result['content']
             
             if isinstance(content, int):
@@ -107,6 +109,7 @@ MIDDLEWARE = [
 
 ```python
 from fastapi import FastAPI, Request, Response
+from starlette.concurrency import run_in_threadpool
 from moonito import VisitorTrafficFiltering, Config
 
 app = FastAPI()
@@ -123,9 +126,10 @@ client = VisitorTrafficFiltering(Config(
 @app.middleware("http")
 async def moonito_middleware(request: Request, call_next):
     """Middleware to check visitors"""
-    result = client.evaluate_visitor(request)
+    # In a thread, so a slow decision never stalls your other requests.
+    result = await run_in_threadpool(client.evaluate_visitor, request)
     
-    if result and result['need_to_block']:
+    if result:
         content = result['content']
         
         if isinstance(content, int):

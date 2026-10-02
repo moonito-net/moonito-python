@@ -4,21 +4,35 @@ Moonito Visitor Traffic Filtering Package for Python
 
 import urllib.parse
 import urllib.request
+import http.client
+import ipaddress
 import json
+import logging
 import secrets
 import hmac
+import threading
 from typing import Optional, Dict, Any, Union
 from urllib.parse import urlparse, parse_qs
 
-# urlopen without a timeout inherits the global default socket timeout, which
-# is None, so a call could wait indefinitely and the visitor's page waited with
-# it. The install snippet already promised callers "bounded timeouts"; this is
-# what makes that true.
-#
-# Generous rather than tight: a check that gives up early is recorded as "could
-# not run" and the visitor is let through unchecked, which is the failure this
-# library exists to prevent.
+logger = logging.getLogger('moonito')
+
+# Only reaching the API is timed. Once connected the SDK waits for the decision
+# however long it takes, because a check that gives up early lets the visitor
+# through unchecked, and blocking them is the reason this library is installed.
+CONNECT_TIMEOUT_SECONDS = 10
+
+# Used only for fetching the unwanted-visitor page (action 3).
 REQUEST_TIMEOUT_SECONDS = 15
+
+# Cloudflare's published edge ranges. CF-Connecting-IP is only read from these.
+CLOUDFLARE_RANGES = [ipaddress.ip_network(r) for r in (
+    '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
+    '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20',
+    '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
+    '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+    '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32',
+    '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32',
+)]
 
 
 class Config:
@@ -31,7 +45,8 @@ class Config:
         unwanted_visitor_to: Optional[str] = None,
         unwanted_visitor_action: Optional[int] = None,
         challenge_action: str = 'allow',
-        endpoint: Optional[str] = None
+        endpoint: Optional[str] = None,
+        trusted_proxies: Optional[list] = None
     ):
         self.is_protected = is_protected
         self.api_public_key = api_public_key
@@ -39,6 +54,10 @@ class Config:
         self.unwanted_visitor_to = unwanted_visitor_to
         self.unwanted_visitor_action = unwanted_visitor_action
         self.endpoint = endpoint
+
+        # Public proxy or load balancer addresses whose X-Forwarded-For may be
+        # believed. Private addresses and Cloudflare need no listing.
+        self.trusted_proxies = trusted_proxies or []
 
         # What to do when the engine asks for a challenge.
         #
@@ -68,6 +87,18 @@ class VisitorTrafficFiltering:
         """
         self.config = config
         self.bypass_token = self._generate_secure_token()
+
+        # Per thread, so on a threaded server one visitor's identity cookie can
+        # never be handed to another visitor's response.
+        self._local = threading.local()
+
+    @property
+    def pending_token(self):
+        return getattr(self._local, 'pending_token', None)
+
+    @pending_token.setter
+    def pending_token(self, value):
+        self._local.pending_token = value
     
     def apply_token(self, response):
         """Set the identity cookie on a framework response, if one is due.
@@ -128,15 +159,26 @@ class VisitorTrafficFiltering:
         Returns:
             Dictionary with blocking information or None if visitor is allowed
             
-        Raises:
-            Exception: If there's an issue with the IP address or API request
+        Never raises. When the check cannot run (unreachable API, a refusal
+        such as an expired plan, an unreadable address) the visitor is let
+        through and the reason goes to the 'moonito' logger. Raising here used
+        to turn a protection problem into a 500 for every visitor.
         """
+        try:
+            return self._evaluate_visitor(request)
+        except Exception as error:
+            logger.warning('moonito: check could not run, visitor allowed: %s', error)
+            return None
+
+    def _evaluate_visitor(self, request) -> Optional[Dict[str, Any]]:
+        self.pending_token = None
+
         if not self.config.is_protected:
             return None
         
         # Check for valid bypass token
-        bypass_header = request.headers.get(self.BYPASS_HEADER.lower())
-        token_header = request.headers.get(self.BYPASS_TOKEN_HEADER.lower())
+        bypass_header = self._header(request, self.BYPASS_HEADER)
+        token_header = self._header(request, self.BYPASS_TOKEN_HEADER)
         
         if bypass_header == '1' and self._is_valid_bypass_token(token_header):
             return None
@@ -152,76 +194,71 @@ class VisitorTrafficFiltering:
         
         # Extract request information
         client_ip = self._get_client_ip(request)
-        user_agent = request.headers.get('User-Agent', '')
-        url = request.path
-        domain = request.host.lower() if hasattr(request, 'host') else ''
-        
-        if not self._is_valid_ip(client_ip):
-            raise ValueError("Invalid IP address.")
-        
-        try:
-            response_data = self._request_analytics_api(
-                client_ip, user_agent, url, domain,
-                client_token=self._read_client_token(request),
-                request_headers=self._collect_headers(request),
-                challenge_pass=self._read_challenge_pass(request),
-                method=getattr(request, 'method', None),
-                path=url,
-            )
-            
-            if response_data.get('error'):
-                error_msg = response_data['error'].get('message', 'Unknown error')
-                if isinstance(error_msg, list):
-                    error_msg = ', '.join(error_msg)
-                raise Exception(f"Requesting analytics error: {error_msg}")
-            
-            # Kept on the instance so a caller can apply it to whatever
-            # response their framework ends up sending. Without this the
-            # visitor is anonymous on every request and the detectors that
-            # reason across requests never get anything to work with.
-            self.pending_token = self.client_token_cookie(response_data)
+        user_agent = self._header(request, 'User-Agent') or ''
+        url = self._get_path(request)
+        domain = self._get_host(request)
 
-            need_to_block = response_data.get('data', {}).get('status', {}).get('need_to_block', False)
-            detect_activity = response_data.get('data', {}).get('status', {}).get('detect_activity')
-            
-            if need_to_block:
+        if not self._is_valid_ip(client_ip):
+            raise ValueError("could not determine the visitor IP")
+
+        response_data = self._request_analytics_api(
+            client_ip, user_agent, url, domain,
+            client_token=self._read_client_token(request),
+            request_headers=self._collect_headers(request),
+            challenge_pass=self._read_challenge_pass(request),
+            method=getattr(request, 'method', None),
+            path=url,
+        )
+
+        if response_data.get('error'):
+            error_msg = response_data['error'].get('message', 'Unknown error')
+            if isinstance(error_msg, list):
+                error_msg = ', '.join(error_msg)
+            raise Exception(f"API refused the check: {error_msg}")
+
+        # Kept per thread so a caller can apply it to whatever
+        # response their framework ends up sending. Without this the
+        # visitor is anonymous on every request and the detectors that
+        # reason across requests never get anything to work with.
+        self.pending_token = self.client_token_cookie(response_data)
+
+        need_to_block = response_data.get('data', {}).get('status', {}).get('need_to_block', False)
+        detect_activity = response_data.get('data', {}).get('status', {}).get('detect_activity')
+
+        if need_to_block:
+            return {
+                'need_to_block': True,
+                'detect_activity': detect_activity,
+                'content': self._get_blocked_content()
+            }
+
+        # A challenge is outranked by a block, so it is only considered
+        # once the visitor was not blocked outright.
+        challenge_url = response_data.get('data', {}).get('challenge_url')
+
+        if isinstance(challenge_url, str) and challenge_url:
+            action = getattr(self.config, 'challenge_action', 'allow')
+
+            if action == 'challenge':
+                return {
+                    'need_to_block': False,
+                    'challenge': True,
+                    'detect_activity': detect_activity,
+                    'content': self.challenge_html(request, challenge_url),
+                }
+
+            if action == 'block':
                 return {
                     'need_to_block': True,
                     'detect_activity': detect_activity,
-                    'content': self._get_blocked_content()
+                    'content': self._get_blocked_content(),
                 }
 
-            # A challenge is outranked by a block, so it is only considered
-            # once the visitor was not blocked outright.
-            challenge_url = response_data.get('data', {}).get('challenge_url')
+            # 'allow' falls through: the verdict is logged server side and
+            # the visitor is not interrupted.
 
-            if isinstance(challenge_url, str) and challenge_url:
-                action = getattr(self.config, 'challenge_action', 'allow')
+        return None
 
-                if action == 'challenge':
-                    return {
-                        'need_to_block': False,
-                        'challenge': True,
-                        'detect_activity': detect_activity,
-                        'content': self.challenge_html(request, challenge_url),
-                    }
-
-                if action == 'block':
-                    return {
-                        'need_to_block': True,
-                        'detect_activity': detect_activity,
-                        'content': self._get_blocked_content(),
-                    }
-
-                # 'allow' falls through: the verdict is logged server side and
-                # the visitor is not interrupted.
-
-            return None
-            
-        except Exception as error:
-            print(f"Error handling visitor: {error}")
-            raise Exception(f"Error handling visitor: {str(error)}")
-    
     def evaluate_visitor_manually(
         self, ip: str, user_agent: str, event: str, domain: str
     ) -> Dict[str, Any]:
@@ -237,9 +274,18 @@ class VisitorTrafficFiltering:
         Returns:
             Dictionary containing need_to_block, detect_activity, and content
             
-        Raises:
-            Exception: If there's an issue with the IP address or API request
+        Never raises: when the check cannot run the visitor is reported as
+        allowed and the reason goes to the 'moonito' logger.
         """
+        try:
+            return self._evaluate_visitor_manually(ip, user_agent, event, domain)
+        except Exception as error:
+            logger.warning('moonito: check could not run, visitor allowed: %s', error)
+            return {'need_to_block': False, 'detect_activity': None, 'content': None}
+
+    def _evaluate_visitor_manually(
+        self, ip: str, user_agent: str, event: str, domain: str
+    ) -> Dict[str, Any]:
         if not self.config.is_protected:
             return {
                 'need_to_block': False,
@@ -264,37 +310,32 @@ class VisitorTrafficFiltering:
         
         if not self._is_valid_ip(ip):
             raise ValueError("Invalid IP address.")
-        
-        try:
-            response_data = self._request_analytics_api(ip, user_agent, event, domain)
-            
-            if response_data.get('error'):
-                error_msg = response_data['error'].get('message', 'Unknown error')
-                if isinstance(error_msg, list):
-                    error_msg = ', '.join(error_msg)
-                raise Exception(f"Requesting analytics error: {error_msg}")
-            
-            need_to_block = response_data.get('data', {}).get('status', {}).get('need_to_block', False)
-            detect_activity = response_data.get('data', {}).get('status', {}).get('detect_activity')
-            
-            if need_to_block:
-                return {
-                    'need_to_block': True,
-                    'detect_activity': detect_activity,
-                    'content': self._get_blocked_content()
-                }
-            
+
+        response_data = self._request_analytics_api(ip, user_agent, event, domain)
+
+        if response_data.get('error'):
+            error_msg = response_data['error'].get('message', 'Unknown error')
+            if isinstance(error_msg, list):
+                error_msg = ', '.join(error_msg)
+            raise Exception(f"API refused the check: {error_msg}")
+
+        need_to_block = response_data.get('data', {}).get('status', {}).get('need_to_block', False)
+        detect_activity = response_data.get('data', {}).get('status', {}).get('detect_activity')
+
+        if need_to_block:
             return {
-                'need_to_block': False,
+                'need_to_block': True,
                 'detect_activity': detect_activity,
-                'content': None
+                'content': self._get_blocked_content()
             }
-            
-        except Exception as error:
-            print(f"Error handling visitor manually: {error}")
-            raise Exception(f"Error handling visitor manually: {str(error)}")
-    
-    VERSION = '2.0.0'
+
+        return {
+            'need_to_block': False,
+            'detect_activity': detect_activity,
+            'content': None
+        }
+
+    VERSION = '2.2.0'
     IDENTITY_COOKIE = '__mo_ct'
     PASS_COOKIE = '__mo_pass'
 
@@ -443,16 +484,31 @@ class VisitorTrafficFiltering:
             'X-Secret-Key': self.config.api_secret_key,
         }
 
-        req = urllib.request.Request(url, data=payload, headers=headers, method='POST')
+        parsed = urlparse(url)
+        connection_class = http.client.HTTPConnection if parsed.scheme == 'http' else http.client.HTTPSConnection
+        connection = connection_class(parsed.hostname, parsed.port, timeout=CONNECT_TIMEOUT_SECONDS)
 
         try:
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-                data = response.read().decode('utf-8')
-                return json.loads(data)
-        except (urllib.error.URLError, TimeoutError) as e:
-            # A connect timeout arrives wrapped in URLError, a read timeout as
-            # a bare TimeoutError. Both mean the same thing to the caller.
+            connection.connect()
+            # Connected: from here on wait for the decision however long it takes.
+            connection.sock.settimeout(None)
+            connection.request('POST', parsed.path, body=payload, headers=headers)
+            response = connection.getresponse()
+            data = response.read().decode('utf-8')
+        except (OSError, http.client.HTTPException) as e:
             raise Exception(f"API request failed: {str(e)}")
+        finally:
+            connection.close()
+
+        try:
+            decoded = json.loads(data)
+        except ValueError:
+            raise Exception(f"API answered HTTP {response.status} without JSON")
+
+        if not isinstance(decoded, dict):
+            raise Exception(f"API answered HTTP {response.status} with an unexpected body")
+
+        return decoded
 
     def _endpoint(self) -> str:
         configured = getattr(self.config, 'endpoint', None)
@@ -470,7 +526,7 @@ class VisitorTrafficFiltering:
         language. The server checks it and a forged one simply fails there.
         """
         try:
-            cookies = getattr(request, 'cookies', None) or {}
+            cookies = getattr(request, 'cookies', None) or getattr(request, 'COOKIES', None) or {}
             value = cookies.get(self.PASS_COOKIE)
         except Exception:
             return None
@@ -489,7 +545,7 @@ class VisitorTrafficFiltering:
         whose history to consult, so passing a forged one along is harmless.
         """
         try:
-            cookies = getattr(request, 'cookies', None) or {}
+            cookies = getattr(request, 'cookies', None) or getattr(request, 'COOKIES', None) or {}
             value = cookies.get(self.IDENTITY_COOKIE)
         except Exception:
             return None
@@ -598,28 +654,160 @@ class VisitorTrafficFiltering:
         except ValueError:
             return False
     
+    def _header(self, request, name: str) -> Optional[str]:
+        """A request header, case-insensitively, on Flask, Django or Starlette."""
+        headers = getattr(request, 'headers', None)
+
+        if headers is not None:
+            try:
+                value = headers.get(name)
+                if value is None:
+                    value = headers.get(name.lower())
+                if value is not None:
+                    return value
+            except Exception:
+                pass
+
+        meta = getattr(request, 'META', None)
+
+        if isinstance(meta, dict):
+            return meta.get('HTTP_' + name.upper().replace('-', '_'))
+
+        return None
+
+    def _remote_addr(self, request) -> str:
+        """The address that actually connected, on Flask, Django or Starlette."""
+        remote = getattr(request, 'remote_addr', None)
+
+        if not remote:
+            meta = getattr(request, 'META', None)
+            if isinstance(meta, dict):
+                remote = meta.get('REMOTE_ADDR')
+
+        if not remote:
+            client = getattr(request, 'client', None)
+            remote = getattr(client, 'host', None)
+
+        return str(remote or '')
+
+    def _get_path(self, request) -> str:
+        url = getattr(request, 'url', None)
+
+        if url is not None and hasattr(url, 'path') and not isinstance(url, str):
+            return url.path or '/'
+
+        return getattr(request, 'path', None) or '/'
+
+    def _get_host(self, request) -> str:
+        host = None
+        get_host = getattr(request, 'get_host', None)
+
+        if callable(get_host):
+            try:
+                host = get_host()
+            except Exception:
+                host = None
+
+        if not host:
+            host = getattr(request, 'host', None)
+
+        if not host or not isinstance(host, str):
+            host = self._header(request, 'Host') or ''
+
+        host = host.lower()
+
+        if host.startswith('['):
+            return host.split(']')[0] + ']'
+
+        return host.rsplit(':', 1)[0] if host.count(':') == 1 else host
+
+    def _ip(self, value: str):
+        try:
+            ip = ipaddress.ip_address(value.strip().strip('[]'))
+        except ValueError:
+            return None
+
+        mapped = getattr(ip, 'ipv4_mapped', None)
+
+        return mapped or ip
+
+    def _in_ranges(self, ip, ranges) -> bool:
+        for network in ranges:
+            if ip.version == network.version and ip in network:
+                return True
+
+        return False
+
+    def _trusted_networks(self):
+        networks = []
+
+        for entry in getattr(self.config, 'trusted_proxies', None) or []:
+            try:
+                networks.append(ipaddress.ip_network(str(entry), strict=False))
+            except ValueError:
+                continue
+
+        return networks
+
     def _get_client_ip(self, request) -> str:
-        """Extract client IP from request, considering proxies"""
-        # Try X-Forwarded-For first (for proxied requests)
-        forwarded = request.headers.get('X-Forwarded-For')
-        if forwarded:
-            # X-Forwarded-For can contain multiple IPs, get the first one
-            return forwarded.split(',')[0].strip()
-        
-        # Fall back to remote_addr
-        return getattr(request, 'remote_addr', '127.0.0.1')
-    
+        """The visitor's address.
+
+        Forwarded headers are set by whoever makes the request, so they are
+        only believed when the connection came from a proxy: a private address,
+        one listed in trusted_proxies, or Cloudflare for CF-Connecting-IP.
+        Taking the first X-Forwarded-For value as before let a bot claim any
+        clean address it liked.
+        """
+        remote = self._ip(self._remote_addr(request))
+
+        if remote is None:
+            return ''
+
+        trusted = self._trusted_networks()
+        from_cloudflare = self._in_ranges(remote, CLOUDFLARE_RANGES)
+        from_proxy = from_cloudflare or remote.is_private or remote.is_loopback or self._in_ranges(remote, trusted)
+
+        if not from_proxy:
+            return str(remote)
+
+        if from_cloudflare:
+            cf = self._ip(self._header(request, 'CF-Connecting-IP') or '')
+            if cf is not None:
+                return str(cf)
+
+        forwarded = self._header(request, 'X-Forwarded-For') or ''
+
+        for part in reversed(forwarded.split(',')):
+            candidate = self._ip(part)
+
+            if candidate is None:
+                continue
+
+            if candidate.is_private or candidate.is_loopback or self._in_ranges(candidate, trusted) \
+                    or self._in_ranges(candidate, CLOUDFLARE_RANGES):
+                continue
+
+            return str(candidate)
+
+        return str(remote)
+
     def _get_current_url(self, request) -> str:
         """Get the current full URL from the request"""
-        scheme = request.scheme if hasattr(request, 'scheme') else 'http'
-        host = request.host if hasattr(request, 'host') else ''
-        path = request.path if hasattr(request, 'path') else ''
-        query = request.query_string.decode('utf-8') if hasattr(request, 'query_string') else ''
-        
-        url = f"{scheme}://{host}{path}"
+        scheme = getattr(request, 'scheme', None)
+        if not isinstance(scheme, str):
+            scheme = getattr(getattr(request, 'url', None), 'scheme', None) or 'http'
+
+        query = getattr(request, 'query_string', None)
+        if isinstance(query, bytes):
+            query = query.decode('utf-8', 'replace')
+        elif not isinstance(query, str):
+            query = getattr(getattr(request, 'url', None), 'query', None) \
+                or (getattr(request, 'META', None) or {}).get('QUERY_STRING', '') or ''
+
+        url = f"{scheme}://{self._get_host(request)}{self._get_path(request)}"
         if query:
             url += f"?{query}"
-        
+
         return url
     
     def _urls_match(self, current_url: str, target_url: str) -> bool:
