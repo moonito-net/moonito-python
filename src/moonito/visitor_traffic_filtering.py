@@ -12,6 +12,9 @@ import re
 import logging
 import secrets
 import hmac
+import hashlib
+import threading
+from .sensor_script import SENSOR_SCRIPT, SENSOR_VERSION as RELAY_SENSOR_VERSION
 from contextvars import ContextVar
 from typing import Optional, Dict, Any, Union
 from urllib.parse import urlparse, parse_qs
@@ -100,6 +103,8 @@ class VisitorTrafficFiltering:
         self._token = ContextVar('moonito_token', default=None)
         self._context_cookie = ContextVar('moonito_context', default=None)
         self._sensor = ContextVar('moonito_sensor', default=False)
+        self._relay = ContextVar('moonito_relay', default=None)
+        self._page_path = ContextVar('moonito_page_path', default='')
 
     @property
     def pending_token(self):
@@ -115,10 +120,11 @@ class VisitorTrafficFiltering:
         Call this once per request, after evaluate_visitor. It is a no-op when
         there is nothing to set, so it is safe to call unconditionally.
         """
-        cookies = tuple(c for c in (self.pending_token, self._context_cookie.get(), self._sensor_marker()) if c)
+        cookies = tuple(c for c in (self.pending_token, self._context_cookie.get(), self._sensor_marker(), self._relay_marker()) if c)
         self.pending_token = None
         self._context_cookie.set(None)
         self._sensor.set(False)
+        self._relay.set(None)
         return self.apply_cookies(response, cookies)
 
     def evaluate_with_cookies(self, request):
@@ -128,17 +134,21 @@ class VisitorTrafficFiltering:
         Pass this explicit snapshot to apply_cookies in the calling task.
         """
         result = self.evaluate_visitor(request)
-        cookies = tuple(c.copy() for c in (self.pending_token, self._context_cookie.get(), self._sensor_marker()) if c)
+        cookies = tuple(c.copy() for c in (self.pending_token, self._context_cookie.get(), self._sensor_marker(), self._relay_marker()) if c)
         self.pending_token = None
         self._context_cookie.set(None)
         self._sensor.set(False)
+        self._relay.set(None)
         return result, cookies
 
     def apply_cookies(self, response, cookies):
         """Apply the cookie snapshot returned by evaluate_with_cookies."""
         for descriptor in cookies:
             if descriptor.get('sensor'):
-                self._add_sensor(response)
+                self._add_sensor(response, descriptor.get('path') or '')
+                continue
+            if descriptor.get('relay'):
+                self._shape_relay_response(response, descriptor['relay'])
                 continue
             try:
                 response.set_cookie(
@@ -150,15 +160,124 @@ class VisitorTrafficFiltering:
                 logger.warning('moonito: response did not accept the %s cookie', descriptor.get('name', 'Moonito'))
         return response
 
-    SENSOR_VERSION = '1.1.1'
-    SENSOR_SRI = 'sha384-/7UZbqrpJUAKrkuftEAXE/7FurwiJ7NUyeokkvYnYClNLTXAvBCAKqo9pKzC1Zkv'
+    # A sensor tag pasted by hand from the CDN; recognised so it is never doubled.
     SENSOR_PATH = '/gh/moonito-net/sensor@'
+    MAX_BEACON = 8192
     SENSOR_MARKER = 'data-guard-sensor'
     SENSOR_MAX_BYTES = 5 * 1024 * 1024
 
+    def relay_param(self) -> str:
+        """The query parameter the sensor's requests use on this site.
+
+        Derived from the public key, so every site has its own: no URL pattern
+        an ad blocker list could match across customers, and no clash with the
+        site's own parameters. Same rule in every SDK.
+        """
+        digest = hashlib.sha256(('sensor|' + str(self.config.api_public_key)).encode('utf-8')).hexdigest()
+        return '_' + digest[:7]
+
+    def _query_value(self, request, name: str) -> Optional[str]:
+        for attr in ('args', 'GET', 'query_params'):  # Flask, Django, Starlette
+            source = getattr(request, attr, None)
+            if source is not None and hasattr(source, 'get'):
+                try:
+                    value = source.get(name)
+                except Exception:
+                    value = None
+                if value is not None:
+                    return str(value)
+        return None
+
+    def _relay_kind(self, request) -> Optional[str]:
+        kind = self._query_value(request, self.relay_param())
+        method = str(getattr(request, 'method', 'GET') or 'GET').upper()
+        if kind in ('s', 'p'):
+            return kind if method in ('GET', 'HEAD') else None
+        return 't' if kind == 't' and method == 'POST' else None
+
+    def _request_body(self, request) -> bytes:
+        try:
+            if hasattr(request, 'get_data'):  # Flask
+                return request.get_data(cache=True) or b''
+            body = getattr(request, 'body', None)  # Django
+            if isinstance(body, (bytes, bytearray)):
+                return bytes(body)
+            cached = getattr(request, '_body', None)  # Starlette, once read with await request.body()
+            if isinstance(cached, (bytes, bytearray)):
+                return bytes(cached)
+        except Exception:
+            pass
+        return b''
+
+    def _answer_relay(self, kind: str, request) -> Dict[str, Any]:
+        """The integration returns this like any answered request; apply_token
+        or apply_cookies then gives it the right headers."""
+        self._relay.set(kind)
+
+        if kind == 's':
+            return {'need_to_block': True, 'sensor': True, 'detect_activity': None, 'content': SENSOR_SCRIPT}
+
+        if kind == 't':
+            beacon = self._request_body(request)[:self.MAX_BEACON + 1]
+            if beacon and len(beacon) <= self.MAX_BEACON:
+                ip = self._get_client_ip(request)
+                # After the browser has its answer, off the request thread.
+                threading.Thread(target=self.relay_beacon, args=(ip, beacon.decode('utf-8', 'replace')), daemon=True).start()
+
+        return {'need_to_block': True, 'sensor': True, 'detect_activity': None, 'content': 204}
+
+    def relay_beacon(self, ip: str, beacon: str) -> None:
+        """Forward a sensor beacon to Moonito, server to server. Two seconds at most; never raises."""
+        if not self._is_valid_ip(ip) or not beacon:
+            return
+        try:
+            body = json.dumps({'ip': ip, 'p': beacon}).encode('utf-8')
+            req = urllib.request.Request(self._endpoint() + '/api/v2/telemetry/relay', data=body, method='POST', headers={
+                'Content-Type': 'application/json',
+                'User-Agent': f'Moonito-Python/{self.VERSION}',
+                'X-Public-Key': self.config.api_public_key,
+                'X-Secret-Key': self.config.api_secret_key,
+            })
+            with urllib.request.urlopen(req, timeout=2) as response:
+                response.read()
+        except Exception as error:
+            logger.debug('moonito: sensor beacon not forwarded: %s', error)
+
+    def _relay_marker(self):
+        kind = self._relay.get()
+        return {'relay': kind} if kind else None
+
+    @staticmethod
+    def _set_header(response, name: str, value: str) -> None:
+        headers = getattr(response, 'headers', None)
+        try:
+            if headers is not None:
+                headers[name] = value
+            else:
+                response[name] = value
+        except Exception:
+            try:
+                response[name] = value
+            except Exception:
+                pass
+
+    def _shape_relay_response(self, response, kind: str) -> None:
+        if kind == 's':
+            if hasattr(response, 'mimetype'):
+                try:
+                    response.mimetype = 'application/javascript'
+                except Exception:
+                    pass
+            self._set_header(response, 'Content-Type', 'application/javascript; charset=utf-8')
+            # Versioned URL, so the browser keeps it for a year.
+            self._set_header(response, 'Cache-Control', 'public, max-age=31536000, immutable')
+            self._set_header(response, 'X-Content-Type-Options', 'nosniff')
+        else:
+            self._set_header(response, 'Cache-Control', 'no-store, private')
+
     def _sensor_marker(self):
         if self._sensor.get() and getattr(self.config, 'inject_sensor', True) and self.config.api_public_key:
-            return {'sensor': True}
+            return {'sensor': True, 'path': self._page_path.get()}
         return None
 
     def _wants_page(self, request) -> bool:
@@ -174,18 +293,19 @@ class VisitorTrafficFiltering:
         dest = (self._header(request, 'Sec-Fetch-Dest') or '').lower()
         return dest in ('', 'document', 'iframe')
 
-    def insert_sensor(self, html: str) -> Optional[str]:
+    def insert_sensor(self, html: str, path: str = '') -> Optional[str]:
         """The page with the sensor tag added, or None to leave it alone."""
         if not html or self.SENSOR_PATH in html or self.SENSOR_MARKER in html:
             return None
         if re.search(r'<meta[^>]+http-equiv\s*=\s*["\']?content-security-policy', html, re.I):
             return None
         key = html_escape(str(self.config.api_public_key), quote=True)
-        endpoint = ''
-        if self.config.endpoint and not re.match(r'^https://moonito\.net/?$', self.config.endpoint):
-            endpoint = ' data-endpoint="%s"' % html_escape(self.config.endpoint.rstrip('/'), quote=True)
-        tag = ('<script defer src="https://cdn.jsdelivr.net%s%s/t.js" integrity="%s" crossorigin="anonymous"'
-               ' data-key="%s"%s %s></script>') % (self.SENSOR_PATH, self.SENSOR_VERSION, self.SENSOR_SRI, key, endpoint, self.SENSOR_MARKER)
+        param = self.relay_param()
+        # Served by this SDK from the page's own URL (_answer_relay): no other
+        # host, nothing that names the service.
+        at = html_escape(path, quote=True)
+        tag = '<script defer src="%s?%s=s&amp;v=%s"%s data-key="%s" data-p="%s" %s></script>' % (
+            at, param, RELAY_SENSOR_VERSION, (' data-endpoint="%s"' % at) if at else '', key, param, self.SENSOR_MARKER)
         head = re.search(r'</head>', html, re.I)
         if head:
             return html[:head.start()] + tag + html[head.start():]
@@ -219,24 +339,50 @@ class VisitorTrafficFiltering:
             return False
         if self._response_header(response, 'Content-Encoding'):
             return False
-        if self._response_header(response, 'Content-Security-Policy'):
+        if not self._csp_allows_self(self._response_header(response, 'Content-Security-Policy')):
             return False
         if 'attachment' in (self._response_header(response, 'Content-Disposition') or '').lower():
             return False
         return True
 
-    def _with_sensor(self, body) -> Optional[bytes]:
+    @staticmethod
+    def _csp_allows_self(header) -> bool:
+        """The sensor is served from the site itself, so 'self' for scripts and
+        requests is all it needs. Nonce or 'strict-dynamic' policies are left alone."""
+        if not header:
+            return True
+        directives = {}
+        for part in str(header).split(';'):
+            tokens = part.strip().split()
+            if tokens and tokens[0].lower() not in directives:
+                directives[tokens[0].lower()] = [t.lower() for t in tokens[1:]]
+        script = directives.get('script-src-elem') or directives.get('script-src') or directives.get('default-src')
+        connect = directives.get('connect-src') or directives.get('default-src')
+
+        def allows(sources):
+            return sources is None or ("'none'" not in sources and ("'self'" in sources or '*' in sources))
+
+        return not (script and "'strict-dynamic'" in script) and allows(script) and allows(connect)
+
+    def _safe_path(self, request) -> str:
+        """This page's own path, known to reach this SDK. Written into the tag so
+        the sensor always comes back to it, even with a <base href> or after a
+        single-page app changes the address."""
+        path = str(self._get_path(request) or '/').split('?', 1)[0]
+        return path if re.match(r'^/[^\s"<>\\]{0,2047}$', path) else '/'
+
+    def _with_sensor(self, body, path: str = '') -> Optional[bytes]:
         if isinstance(body, str):
             body = body.encode('utf-8')
         if not isinstance(body, (bytes, bytearray)) or not body or len(body) > self.SENSOR_MAX_BYTES:
             return None
         try:
-            changed = self.insert_sensor(bytes(body).decode('utf-8'))
+            changed = self.insert_sensor(bytes(body).decode('utf-8'), path)
         except UnicodeDecodeError:
             return None
         return changed.encode('utf-8') if changed is not None else None
 
-    def _add_sensor(self, response) -> None:
+    def _add_sensor(self, response, path: str = '') -> None:
         """Insert the sensor into a Flask, Django or Starlette response. Never raises."""
         try:
             if not self._sensor_target(response):
@@ -246,7 +392,7 @@ class VisitorTrafficFiltering:
             if hasattr(response, 'get_data') and hasattr(response, 'set_data'):
                 if getattr(response, 'direct_passthrough', False) or getattr(response, 'is_streamed', False):
                     return
-                new = self._with_sensor(response.get_data())
+                new = self._with_sensor(response.get_data(), path)
                 if new is not None:
                     response.set_data(new)
                 return
@@ -255,7 +401,7 @@ class VisitorTrafficFiltering:
             if hasattr(response, 'streaming') and hasattr(response, 'content'):
                 if response.streaming:
                     return
-                new = self._with_sensor(response.content)
+                new = self._with_sensor(response.content, path)
                 if new is not None:
                     response.content = new
                     if response.has_header('Content-Length'):
@@ -282,7 +428,7 @@ class VisitorTrafficFiltering:
                                 yield rest
                             return
                     body = b''.join(chunks)
-                    new = add(body)
+                    new = add(body, path)
                     yield new if new is not None else body
 
                 response.body_iterator = with_sensor()
@@ -292,7 +438,7 @@ class VisitorTrafficFiltering:
 
             # Starlette Response built in full
             if isinstance(getattr(response, 'body', None), (bytes, bytearray)):
-                new = self._with_sensor(response.body)
+                new = self._with_sensor(response.body, path)
                 if new is not None:
                     response.body = new
                     response.headers['content-length'] = str(len(new))
@@ -345,9 +491,17 @@ class VisitorTrafficFiltering:
         self.pending_token = None
         self._context_cookie.set(None)
         self._sensor.set(False)
+        self._relay.set(None)
 
         if not self.config.is_protected:
             return None
+
+        # The browser sensor's own requests (script, timing, beacon) come to
+        # this same URL with a parameter only this site uses. Answered here,
+        # before any decision, so the browser only ever talks to this site.
+        relay = self._relay_kind(request) if getattr(self.config, 'inject_sensor', True) else None
+        if relay is not None:
+            return self._answer_relay(relay, request)
         
         # Check for valid bypass token
         bypass_header = self._header(request, self.BYPASS_HEADER)
@@ -377,6 +531,7 @@ class VisitorTrafficFiltering:
         # Set before the API call, so a visitor let through because the check
         # could not run still gets the sensor. Cleared again on a block.
         self._sensor.set(self._wants_page(request))
+        self._page_path.set(self._safe_path(request))
 
         response_data = self._request_analytics_api(
             client_ip, user_agent, url, domain,
@@ -525,7 +680,7 @@ class VisitorTrafficFiltering:
             'content': None
         }
 
-    VERSION = '2.3.0'
+    VERSION = '2.4.0'
     IDENTITY_COOKIE = '__mo_ct'
     PASS_COOKIE = '__mo_pass'
 

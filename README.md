@@ -130,6 +130,10 @@ client = VisitorTrafficFiltering(Config(
 @app.middleware("http")
 async def moonito_middleware(request: Request, call_next):
     """Middleware to check visitors"""
+    # Read the body first, so the SDK can forward the browser sensor's beacon.
+    if request.method == "POST":
+        await request.body()
+
     # In a thread, so a slow decision never stalls your other requests.
     result, cookies = await run_in_threadpool(client.evaluate_with_cookies, request)
     
@@ -161,6 +165,8 @@ def read_root():
 | `inject_sensor` | `bool` | Add the browser sensor to your HTML pages in `apply_token` / `apply_cookies`. Default `True`, so there is no separate script to paste. Pages with a Content-Security-Policy, compressed or streamed responses are left untouched. |
 
 Since 2.3.0 the browser sensor is added for you through the `apply_token` / `apply_cookies` call you already make. If you pasted the sensor tag into your template before, you can remove it; it is never added twice.
+
+Since 2.4.0 the sensor is served from your own site: its script, timing requests and beacon go to your page's own URL with a parameter unique to your site, and the SDK forwards the beacon to Moonito from your server. Visitors' browsers never contact another host, so ad blockers do not stop it. With FastAPI, read the request body before the check (`await request.body()`, as in the example above) so beacons can be forwarded.
 
 ## 🔧 Manual Evaluation
 
