@@ -7,10 +7,12 @@ import urllib.request
 import http.client
 import ipaddress
 import json
+from html import escape as html_escape
+import re
 import logging
 import secrets
 import hmac
-import threading
+from contextvars import ContextVar
 from typing import Optional, Dict, Any, Union
 from urllib.parse import urlparse, parse_qs
 
@@ -46,7 +48,8 @@ class Config:
         unwanted_visitor_action: Optional[int] = None,
         challenge_action: str = 'allow',
         endpoint: Optional[str] = None,
-        trusted_proxies: Optional[list] = None
+        trusted_proxies: Optional[list] = None,
+        inject_sensor: bool = True
     ):
         self.is_protected = is_protected
         self.api_public_key = api_public_key
@@ -58,6 +61,11 @@ class Config:
         # Public proxy or load balancer addresses whose X-Forwarded-For may be
         # believed. Private addresses and Cloudflare need no listing.
         self.trusted_proxies = trusted_proxies or []
+
+        # Add the browser sensor to HTML pages in apply_token/apply_cookies,
+        # so there is no second script to paste. Pages that are compressed,
+        # carry a Content-Security-Policy, or already have it are left alone.
+        self.inject_sensor = inject_sensor
 
         # What to do when the engine asks for a challenge.
         #
@@ -88,45 +96,208 @@ class VisitorTrafficFiltering:
         self.config = config
         self.bypass_token = self._generate_secure_token()
 
-        # Per thread, so on a threaded server one visitor's identity cookie can
-        # never be handed to another visitor's response.
-        self._local = threading.local()
+        # Isolated across both worker threads and concurrent async requests.
+        self._token = ContextVar('moonito_token', default=None)
+        self._context_cookie = ContextVar('moonito_context', default=None)
+        self._sensor = ContextVar('moonito_sensor', default=False)
 
     @property
     def pending_token(self):
-        return getattr(self._local, 'pending_token', None)
+        return self._token.get()
 
     @pending_token.setter
     def pending_token(self, value):
-        self._local.pending_token = value
+        self._token.set(value)
     
     def apply_token(self, response):
-        """Set the identity cookie on a framework response, if one is due.
+        """Set identity and sensor context cookies on a framework response.
 
         Call this once per request, after evaluate_visitor. It is a no-op when
         there is nothing to set, so it is safe to call unconditionally.
         """
-        descriptor = getattr(self, 'pending_token', None)
-
-        if not descriptor:
-            return response
-
+        cookies = tuple(c for c in (self.pending_token, self._context_cookie.get(), self._sensor_marker()) if c)
         self.pending_token = None
+        self._context_cookie.set(None)
+        self._sensor.set(False)
+        return self.apply_cookies(response, cookies)
 
-        try:
-            response.set_cookie(
-                descriptor['name'],
-                descriptor['value'],
-                max_age=descriptor['max_age'],
-                path='/',
-                samesite='Lax',
-            )
-        except Exception:
-            # A framework whose response object works differently. The visitor
-            # simply stays anonymous, which is a supported mode.
-            pass
+    def evaluate_with_cookies(self, request):
+        """Return (verdict, cookies) together when checking in a thread pool.
 
+        Context changes inside a worker do not propagate to the async caller.
+        Pass this explicit snapshot to apply_cookies in the calling task.
+        """
+        result = self.evaluate_visitor(request)
+        cookies = tuple(c.copy() for c in (self.pending_token, self._context_cookie.get(), self._sensor_marker()) if c)
+        self.pending_token = None
+        self._context_cookie.set(None)
+        self._sensor.set(False)
+        return result, cookies
+
+    def apply_cookies(self, response, cookies):
+        """Apply the cookie snapshot returned by evaluate_with_cookies."""
+        for descriptor in cookies:
+            if descriptor.get('sensor'):
+                self._add_sensor(response)
+                continue
+            try:
+                response.set_cookie(
+                    descriptor['name'], descriptor['value'],
+                    max_age=descriptor['max_age'], path='/', samesite='Lax',
+                    secure=descriptor.get('secure', False), httponly=False,
+                )
+            except Exception:
+                logger.warning('moonito: response did not accept the %s cookie', descriptor.get('name', 'Moonito'))
         return response
+
+    SENSOR_VERSION = '1.1.1'
+    SENSOR_SRI = 'sha384-/7UZbqrpJUAKrkuftEAXE/7FurwiJ7NUyeokkvYnYClNLTXAvBCAKqo9pKzC1Zkv'
+    SENSOR_PATH = '/gh/moonito-net/sensor@'
+    SENSOR_MARKER = 'data-guard-sensor'
+    SENSOR_MAX_BYTES = 5 * 1024 * 1024
+
+    def _sensor_marker(self):
+        if self._sensor.get() and getattr(self.config, 'inject_sensor', True) and self.config.api_public_key:
+            return {'sensor': True}
+        return None
+
+    def _wants_page(self, request) -> bool:
+        """A page request, not an API call or an asset."""
+        method = str(getattr(request, 'method', 'GET') or 'GET').upper()
+        if method not in ('GET', 'POST'):
+            return False
+        if (self._header(request, 'X-Requested-With') or '').lower() == 'xmlhttprequest':
+            return False
+        accept = (self._header(request, 'Accept') or '').lower()
+        if accept and 'text/html' not in accept and '*/*' not in accept:
+            return False
+        dest = (self._header(request, 'Sec-Fetch-Dest') or '').lower()
+        return dest in ('', 'document', 'iframe')
+
+    def insert_sensor(self, html: str) -> Optional[str]:
+        """The page with the sensor tag added, or None to leave it alone."""
+        if not html or self.SENSOR_PATH in html or self.SENSOR_MARKER in html:
+            return None
+        if re.search(r'<meta[^>]+http-equiv\s*=\s*["\']?content-security-policy', html, re.I):
+            return None
+        key = html_escape(str(self.config.api_public_key), quote=True)
+        endpoint = ''
+        if self.config.endpoint and not re.match(r'^https://moonito\.net/?$', self.config.endpoint):
+            endpoint = ' data-endpoint="%s"' % html_escape(self.config.endpoint.rstrip('/'), quote=True)
+        tag = ('<script defer src="https://cdn.jsdelivr.net%s%s/t.js" integrity="%s" crossorigin="anonymous"'
+               ' data-key="%s"%s %s></script>') % (self.SENSOR_PATH, self.SENSOR_VERSION, self.SENSOR_SRI, key, endpoint, self.SENSOR_MARKER)
+        head = re.search(r'</head>', html, re.I)
+        if head:
+            return html[:head.start()] + tag + html[head.start():]
+        body = re.search(r'<body\b[^>]*>', html, re.I)
+        if body:
+            return html[:body.end()] + tag + html[body.end():]
+        return None
+
+    @staticmethod
+    def _response_header(response, name: str) -> Optional[str]:
+        headers = getattr(response, 'headers', None)
+        try:
+            if headers is not None and hasattr(headers, 'get'):
+                value = headers.get(name)
+                if value is None:
+                    value = headers.get(name.lower())
+                return value
+            if hasattr(response, 'get'):
+                return response.get(name)
+        except Exception:
+            return None
+        return None
+
+    def _sensor_target(self, response) -> bool:
+        """Whether this response is a whole HTML page we may touch."""
+        status = int(getattr(response, 'status_code', 200) or 200)
+        if status < 200 or status >= 300 or status == 204:
+            return False
+        content_type = (self._response_header(response, 'Content-Type') or '').lower()
+        if 'text/html' not in content_type:
+            return False
+        if self._response_header(response, 'Content-Encoding'):
+            return False
+        if self._response_header(response, 'Content-Security-Policy'):
+            return False
+        if 'attachment' in (self._response_header(response, 'Content-Disposition') or '').lower():
+            return False
+        return True
+
+    def _with_sensor(self, body) -> Optional[bytes]:
+        if isinstance(body, str):
+            body = body.encode('utf-8')
+        if not isinstance(body, (bytes, bytearray)) or not body or len(body) > self.SENSOR_MAX_BYTES:
+            return None
+        try:
+            changed = self.insert_sensor(bytes(body).decode('utf-8'))
+        except UnicodeDecodeError:
+            return None
+        return changed.encode('utf-8') if changed is not None else None
+
+    def _add_sensor(self, response) -> None:
+        """Insert the sensor into a Flask, Django or Starlette response. Never raises."""
+        try:
+            if not self._sensor_target(response):
+                return
+
+            # Flask / Werkzeug
+            if hasattr(response, 'get_data') and hasattr(response, 'set_data'):
+                if getattr(response, 'direct_passthrough', False) or getattr(response, 'is_streamed', False):
+                    return
+                new = self._with_sensor(response.get_data())
+                if new is not None:
+                    response.set_data(new)
+                return
+
+            # Django
+            if hasattr(response, 'streaming') and hasattr(response, 'content'):
+                if response.streaming:
+                    return
+                new = self._with_sensor(response.content)
+                if new is not None:
+                    response.content = new
+                    if response.has_header('Content-Length'):
+                        response['Content-Length'] = str(len(new))
+                return
+
+            # Starlette / FastAPI: what call_next returns streams its body.
+            if hasattr(response, 'body_iterator'):
+                original = response.body_iterator
+                limit = self.SENSOR_MAX_BYTES
+                add = self._with_sensor
+
+                async def with_sensor():
+                    chunks, size = [], 0
+                    async for chunk in original:
+                        if isinstance(chunk, str):
+                            chunk = chunk.encode('utf-8')
+                        chunks.append(chunk)
+                        size += len(chunk)
+                        if size > limit:
+                            for held in chunks:
+                                yield held
+                            async for rest in original:
+                                yield rest
+                            return
+                    body = b''.join(chunks)
+                    new = add(body)
+                    yield new if new is not None else body
+
+                response.body_iterator = with_sensor()
+                if 'content-length' in response.headers:
+                    del response.headers['content-length']
+                return
+
+            # Starlette Response built in full
+            if isinstance(getattr(response, 'body', None), (bytes, bytearray)):
+                new = self._with_sensor(response.body)
+                if new is not None:
+                    response.body = new
+                    response.headers['content-length'] = str(len(new))
+        except Exception as error:
+            logger.warning('moonito: sensor not added: %s', error)
 
     def _generate_secure_token(self) -> str:
         """Generate a secure random token for bypass validation"""
@@ -172,6 +343,8 @@ class VisitorTrafficFiltering:
 
     def _evaluate_visitor(self, request) -> Optional[Dict[str, Any]]:
         self.pending_token = None
+        self._context_cookie.set(None)
+        self._sensor.set(False)
 
         if not self.config.is_protected:
             return None
@@ -201,6 +374,10 @@ class VisitorTrafficFiltering:
         if not self._is_valid_ip(client_ip):
             raise ValueError("could not determine the visitor IP")
 
+        # Set before the API call, so a visitor let through because the check
+        # could not run still gets the sensor. Cleared again on a block.
+        self._sensor.set(self._wants_page(request))
+
         response_data = self._request_analytics_api(
             client_ip, user_agent, url, domain,
             client_token=self._read_client_token(request),
@@ -216,16 +393,27 @@ class VisitorTrafficFiltering:
                 error_msg = ', '.join(error_msg)
             raise Exception(f"API refused the check: {error_msg}")
 
-        # Kept per thread so a caller can apply it to whatever
+        # Kept per request context so a caller can apply it to whatever
         # response their framework ends up sending. Without this the
         # visitor is anonymous on every request and the detectors that
         # reason across requests never get anything to work with.
         self.pending_token = self.client_token_cookie(response_data)
+        data = response_data.get('data', {})
+        secure = str(getattr(request, 'scheme', '') or urlparse(current_url).scheme) == 'https'
+        if self.pending_token:
+            self.pending_token['secure'] = secure
+        if data.get('decision_id') and data.get('nonce'):
+            self._context_cookie.set({
+                'name': '__mo_cx',
+                'value': urllib.parse.quote(str(data['decision_id']) + ':' + str(data['nonce']), safe=''),
+                'max_age': 120, 'secure': secure,
+            })
 
         need_to_block = response_data.get('data', {}).get('status', {}).get('need_to_block', False)
         detect_activity = response_data.get('data', {}).get('status', {}).get('detect_activity')
 
         if need_to_block:
+            self._sensor.set(False)
             return {
                 'need_to_block': True,
                 'detect_activity': detect_activity,
@@ -240,6 +428,7 @@ class VisitorTrafficFiltering:
             action = getattr(self.config, 'challenge_action', 'allow')
 
             if action == 'challenge':
+                self._sensor.set(False)
                 return {
                     'need_to_block': False,
                     'challenge': True,
@@ -248,6 +437,7 @@ class VisitorTrafficFiltering:
                 }
 
             if action == 'block':
+                self._sensor.set(False)
                 return {
                     'need_to_block': True,
                     'detect_activity': detect_activity,
@@ -335,7 +525,7 @@ class VisitorTrafficFiltering:
             'content': None
         }
 
-    VERSION = '2.2.0'
+    VERSION = '2.3.0'
     IDENTITY_COOKIE = '__mo_ct'
     PASS_COOKIE = '__mo_pass'
 
@@ -444,8 +634,8 @@ class VisitorTrafficFiltering:
         """
         body: Dict[str, Any] = {
             'ip': ip,
-            'ua': user_agent,
-            'events': event,
+            'ua': user_agent[:2048],
+            'events': event[:4096],
             'domain': domain,
             'sdk': f'python/{self.VERSION}',
         }
@@ -459,16 +649,19 @@ class VisitorTrafficFiltering:
             body['challenge_pass'] = challenge_pass
 
         if method:
-            body['method'] = method
+            body['method'] = method[:16]
 
         if path:
-            body['path'] = path
+            body['path'] = path[:512]
 
-        headers_out = {
-            name: value
-            for name, value in (request_headers or {}).items()
-            if isinstance(value, str) and len(value) <= 2048
-        }
+        headers_out = {}
+        for name, value in (request_headers or {}).items():
+            if str(name).lower() in ('cookie', 'authorization', 'proxy-authorization'):
+                continue
+            if isinstance(value, str):
+                headers_out[name] = value[:2048]
+                if len(headers_out) >= 64:
+                    break
 
         if headers_out:
             body['headers'] = headers_out
@@ -477,7 +670,7 @@ class VisitorTrafficFiltering:
         url = f'{self._endpoint()}/api/v2/decision'
 
         headers = {
-            'User-Agent': user_agent,
+            'User-Agent': f'Moonito-Python/{self.VERSION}',
             'Content-Type': 'application/json',
             'Accept': 'application/json',
             'X-Public-Key': self.config.api_public_key,

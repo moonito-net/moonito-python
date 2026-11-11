@@ -53,6 +53,10 @@ def check_visitor():
         
         return Response(content, mimetype='text/html')
 
+@app.after_request
+def store_moonito_cookies(response):
+    return client.apply_token(response)
+
 @app.route('/')
 def home():
     return 'Hello, World!'
@@ -89,12 +93,12 @@ class MoonitoMiddleware:
             content = result['content']
             
             if isinstance(content, int):
-                return HttpResponse(status=content)
+                return self.client.apply_token(HttpResponse(status=content))
             
-            return HttpResponse(content)
+            return self.client.apply_token(HttpResponse(content))
         
         response = self.get_response(request)
-        return response
+        return self.client.apply_token(response)
 ```
 
 Add to `settings.py`:
@@ -127,18 +131,18 @@ client = VisitorTrafficFiltering(Config(
 async def moonito_middleware(request: Request, call_next):
     """Middleware to check visitors"""
     # In a thread, so a slow decision never stalls your other requests.
-    result = await run_in_threadpool(client.evaluate_visitor, request)
+    result, cookies = await run_in_threadpool(client.evaluate_with_cookies, request)
     
     if result:
         content = result['content']
         
         if isinstance(content, int):
-            return Response(status_code=content)
+            return client.apply_cookies(Response(status_code=content), cookies)
         
-        return Response(content=content, media_type="text/html")
+        return client.apply_cookies(Response(content=content, media_type="text/html"), cookies)
     
     response = await call_next(request)
-    return response
+    return client.apply_cookies(response, cookies)
 
 @app.get("/")
 def read_root():
@@ -154,6 +158,9 @@ def read_root():
 | `api_secret_key` | `str` | Your Moonito API secret key (required) |
 | `unwanted_visitor_to` | `str` | URL to redirect unwanted visitors or HTTP error code |
 | `unwanted_visitor_action` | `int` | Action for unwanted visitors: 1 = Redirect, 2 = Iframe, 3 = Load content |
+| `inject_sensor` | `bool` | Add the browser sensor to your HTML pages in `apply_token` / `apply_cookies`. Default `True`, so there is no separate script to paste. Pages with a Content-Security-Policy, compressed or streamed responses are left untouched. |
+
+Since 2.3.0 the browser sensor is added for you through the `apply_token` / `apply_cookies` call you already make. If you pasted the sensor tag into your template before, you can remove it; it is never added twice.
 
 ## 🔧 Manual Evaluation
 
